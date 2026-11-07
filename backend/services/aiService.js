@@ -1,7 +1,5 @@
 const { OpenAI } = require('openai');
-
-// In-memory conversation store: conversationId -> Array of messages
-const conversationStore = new Map();
+const db = require('../database/db');
 
 // Configurable Context Window Limit (default: last 10 messages)
 const CONTEXT_WINDOW_LIMIT = parseInt(process.env.CONTEXT_WINDOW_LIMIT, 10) || 10;
@@ -12,27 +10,6 @@ Your core strengths:
 1. Memory & Continuity: You actively remember personal details, academic background, goals, and interests that the user shares earlier in the conversation (such as their name, college, study area, and projects).
 2. Persona: Warm, encouraging, concise, and articulate.
 3. Natural Recall: Whenever the user asks you to recall or synthesize things they mentioned previously, accurately provide them with full conversational awareness.`;
-
-/**
- * Get or initialize conversation history for a given conversation ID.
- */
-function getHistory(conversationId) {
-  if (!conversationStore.has(conversationId)) {
-    conversationStore.set(conversationId, []);
-  }
-  return conversationStore.get(conversationId);
-}
-
-/**
- * Clear conversation history for a given conversation ID.
- */
-function clearHistory(conversationId) {
-  if (conversationStore.has(conversationId)) {
-    conversationStore.set(conversationId, []);
-    return true;
-  }
-  return false;
-}
 
 /**
  * Call OpenAI API with context window
@@ -98,7 +75,6 @@ async function callGemini(recentMessages, systemPrompt) {
   const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  // Map messages to Gemini contents (roles: 'user' and 'model')
   const contents = recentMessages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }]
@@ -139,71 +115,61 @@ async function callGemini(recentMessages, systemPrompt) {
 
 /**
  * Main chat handler:
- * 1. Appends user message to history
- * 2. Applies Context Window Management (last N messages)
- * 3. Sends prompt + context window to LLM
- * 4. Appends assistant response to history
- * 5. Returns response and context statistics
+ * 1. Saves user message to database
+ * 2. Fetches full history from database
+ * 3. Applies Context Window Management (last N messages)
+ * 4. Sends prompt + context window to LLM
+ * 5. Saves assistant reply to database
+ * 6. Returns reply and telemetry stats
  */
 async function processChatMessage(conversationId, userMessageText) {
-  const history = getHistory(conversationId);
+  // 1. Persist user message to database
+  await db.saveMessage(conversationId, 'user', userMessageText);
 
-  // 1. Add current user message to conversation history
-  const userMsg = {
-    role: 'user',
-    content: userMessageText,
-    timestamp: new Date().toISOString()
-  };
-  history.push(userMsg);
+  // 2. Fetch full conversation history from database
+  const history = await db.getHistory(conversationId);
 
-  // 2. CONTEXT WINDOW MANAGEMENT: Slice the last N messages
-  // This guarantees we never send unlimited history forever!
+  // 3. CONTEXT WINDOW MANAGEMENT: Slice the last N messages
+  // Retaining the latest N messages along with the system prompt
   const recentMessages = history.slice(-CONTEXT_WINDOW_LIMIT);
   const truncatedCount = Math.max(0, history.length - recentMessages.length);
 
-  // 3. Determine provider (OpenAI vs Gemini)
+  // 4. Determine LLM provider (OpenAI vs Gemini)
   const provider = (process.env.LLM_PROVIDER || 'openai').toLowerCase();
   let botReply = '';
 
-  if (provider === 'gemini' || (!process.env.OPENAI_API_KEY && process.env.GEMINI_API_KEY)) {
+  const hasOpenAI = Boolean(process.env.OPENAI_API_KEY && !process.env.OPENAI_API_KEY.startsWith('your_'));
+  const hasGemini = Boolean(process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEY.startsWith('your_'));
+
+  if (provider === 'gemini' || (!hasOpenAI && hasGemini)) {
     botReply = await callGemini(recentMessages, SYSTEM_PROMPT);
   } else {
-    // If no OpenAI key is set, but Gemini is available, auto-fallback to Gemini
-    const hasOpenAI = process.env.OPENAI_API_KEY && !process.env.OPENAI_API_KEY.startsWith('your_');
-    const hasGemini = process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEY.startsWith('your_');
-
-    if (!hasOpenAI && hasGemini) {
-      botReply = await callGemini(recentMessages, SYSTEM_PROMPT);
-    } else {
-      botReply = await callOpenAI(recentMessages, SYSTEM_PROMPT);
-    }
+    botReply = await callOpenAI(recentMessages, SYSTEM_PROMPT);
   }
 
-  // 4. Record assistant reply in history
-  const assistantMsg = {
-    role: 'assistant',
-    content: botReply,
-    timestamp: new Date().toISOString()
-  };
-  history.push(assistantMsg);
+  // 5. Persist assistant reply to database
+  await db.saveMessage(conversationId, 'assistant', botReply);
 
-  // 5. Return reply and metadata
+  // 6. Return response and context stats
   return {
     reply: botReply,
     conversationId,
     stats: {
-      totalStoredMessages: history.length,
+      totalStoredMessages: history.length + 1,
       contextMessagesSent: recentMessages.length,
       truncatedMessagesCount: truncatedCount,
-      windowLimit: CONTEXT_WINDOW_LIMIT
+      windowLimit: CONTEXT_WINDOW_LIMIT,
+      database: db.getDBType()
     }
   };
 }
 
 module.exports = {
   processChatMessage,
-  getHistory,
-  clearHistory,
+  getHistory: db.getHistory,
+  clearHistory: db.clearHistory,
+  getAllConversations: db.getAllConversations,
+  getDBType: db.getDBType,
   CONTEXT_WINDOW_LIMIT,
   SYSTEM_PROMPT
 };
