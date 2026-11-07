@@ -11,6 +11,11 @@ dist/
 build/
 .cache/
 
+# Databases & local data stores
+data/
+*.sqlite
+*.db
+
 # Logs
 *.log
 npm-debug.log*
@@ -22,4 +27,3 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
-
